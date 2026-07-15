@@ -10,6 +10,25 @@ Core DocuBot class responsible for:
 import os
 import glob
 
+# --- Retrieval guardrail configuration -----------------------------------
+# Refusal message returned when there is no meaningful evidence to answer.
+NO_ANSWER = "I do not know based on these docs."
+
+# Minimum number of meaningful (non-stopword) query-word matches a chunk
+# must have to count as evidence. Raise this to make DocuBot stricter.
+MIN_EVIDENCE_SCORE = 1
+
+# Common function words that carry no topical meaning. Excluded from scoring
+# so a query like "how does the ... work" can't match on noise alone.
+STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "if", "in", "on", "at", "to", "of",
+    "for", "is", "are", "was", "were", "be", "been", "being", "do", "does",
+    "did", "how", "what", "when", "where", "why", "which", "who", "this",
+    "that", "these", "those", "with", "as", "by", "it", "its", "from", "can",
+    "will", "i", "you", "we", "they", "my", "our",
+}
+# -------------------------------------------------------------------------
+
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
         """
@@ -22,8 +41,11 @@ class DocuBot:
         # Load documents into memory
         self.documents = self.load_documents()  # List of (filename, text)
 
-        # Build a retrieval index (implemented in Phase 1)
-        self.index = self.build_index(self.documents)
+        # Split documents into paragraph-sized chunks (the retrieval unit)
+        self.chunks = self.build_chunks(self.documents)  # List of (filename, chunk_text)
+
+        # Build a retrieval index over chunks (implemented in Phase 1)
+        self.index = self.build_index(self.chunks)
 
     # -----------------------------------------------------------
     # Document Loading
@@ -44,27 +66,47 @@ class DocuBot:
                 docs.append((filename, text))
         return docs
 
+    def build_chunks(self, documents):
+        """
+        Split each document into paragraph-sized chunks on blank lines.
+
+        This is what turns retrieval from "return the whole file" into
+        "return the relevant passage." Each chunk keeps its source filename
+        so provenance survives.
+
+        Returns a list of tuples: (filename, chunk_text)
+        """
+        MIN_CHUNK_LEN = 20  # drop lone headings / tiny fragments
+        chunks = []
+        for filename, text in documents:
+            for para in text.split("\n\n"):
+                para = para.strip()
+                if len(para) >= MIN_CHUNK_LEN:
+                    chunks.append((filename, para))
+        return chunks
+
     # -----------------------------------------------------------
     # Index Construction (Phase 1)
     # -----------------------------------------------------------
 
-    def build_index(self, documents):
+    def build_index(self, chunks):
         """
-        TODO (Phase 1):
-        Build a tiny inverted index mapping lowercase words to the documents
-        they appear in.
+        Build a tiny inverted index mapping lowercase words to the chunks
+        they appear in. Chunks are identified by their position in
+        self.chunks, so a token points at specific passages, not whole files.
 
         Example structure:
         {
-            "token": ["AUTH.md", "API_REFERENCE.md"],
-            "database": ["DATABASE.md"]
+            "token": {3, 17},      # chunk indices
+            "database": {42}
         }
 
-        Keep this simple: split on whitespace, lowercase tokens,
-        ignore punctuation if needed.
+        Keep this simple: split on whitespace, lowercase tokens.
         """
         index = {}
-        # TODO: implement simple indexing
+        for i, (_, text) in enumerate(chunks):
+            for token in set(text.lower().split()):   # set() -> list each chunk once per word
+                index.setdefault(token, set()).add(i)
         return index
 
     # -----------------------------------------------------------
@@ -81,8 +123,13 @@ class DocuBot:
         - Count how many appear in the text
         - Return the count as the score
         """
-        # TODO: implement scoring
-        return 0
+        # Only meaningful query words count -- stopwords are ignored so a
+        # match on "the"/"how"/"does" alone never looks like real evidence.
+        query_tokens = {
+            t for t in query.lower().split() if t not in STOPWORDS
+        }
+        doc_tokens = text.lower().split()
+        return sum(1 for t in doc_tokens if t in query_tokens)
 
     def retrieve(self, query, top_k=3):
         """
@@ -91,9 +138,25 @@ class DocuBot:
 
         Return a list of (filename, text) sorted by score descending.
         """
-        results = []
-        # TODO: implement retrieval logic
-        return results[:top_k]
+        query_tokens = query.lower().split()
+
+        # Index as filter: chunks containing ANY query word.
+        candidates = set()
+        for t in query_tokens:
+            candidates.update(self.index.get(t, set()))
+
+        # Score candidate chunks, keeping only those with meaningful evidence.
+        # A chunk that matched only on stopwords scores 0 and is dropped here,
+        # so retrieve() never returns non-evidence to the answer layer.
+        scored = [
+            (self.chunks[i][0], self.chunks[i][1],
+             self.score_document(query, self.chunks[i][1]))
+            for i in candidates
+        ]
+        scored = [row for row in scored if row[2] >= MIN_EVIDENCE_SCORE]
+
+        scored.sort(key=lambda row: row[2], reverse=True)
+        return [(filename, text) for filename, text, _ in scored[:top_k]]
 
     # -----------------------------------------------------------
     # Answering Modes
@@ -107,7 +170,7 @@ class DocuBot:
         snippets = self.retrieve(query, top_k=top_k)
 
         if not snippets:
-            return "I do not know based on these docs."
+            return NO_ANSWER
 
         formatted = []
         for filename, text in snippets:
@@ -129,7 +192,7 @@ class DocuBot:
         snippets = self.retrieve(query, top_k=top_k)
 
         if not snippets:
-            return "I do not know based on these docs."
+            return NO_ANSWER
 
         return self.llm_client.answer_from_snippets(query, snippets)
 
